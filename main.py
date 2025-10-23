@@ -4,6 +4,11 @@ import os
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
+from langchain.schema import HumanMessage
 
 app = FastAPI(title="Multi-Model LLM API")
 
@@ -28,97 +33,96 @@ class GenerateResponse(BaseModel):
 # --- Provider implementations (minimal, REST-based where possible) ---
 
 async def generate_openai(prompt: str, model: Optional[str], max_tokens: int, temperature: float, extra: Optional[dict]):
+    """LangChain-based OpenAI implementation"""
     key = os.getenv("OPENAI_API_KEY")
     if not key:
         raise HTTPException(status_code=400, detail="OPENAI_API_KEY not set")
 
-    model = model or "gpt-4o-mini"
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-    payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    if extra:
-        payload.update(extra)
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(url, json=payload, headers=headers)
-        try:
-            r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=502, detail=f"OpenAI error: {r.text}") from e
-        data = r.json()
-        # Follow ChatCompletions response shape
-        text = ""
-        if "choices" in data and len(data["choices"]) > 0:
-            ch = data["choices"][0]
-            if "message" in ch:
-                text = ch["message"].get("content", "")
-            else:
-                text = ch.get("text", "")
-        else:
-            text = data.get("error", {}).get("message", "") or str(data)
-        return {"text": text, "model": model, "raw": data}
+    model_name = model or "gpt-4o-mini"
+    
+    try:
+        llm = ChatOpenAI(
+            model=model_name,
+            openai_api_key=key,
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+        messages = [HumanMessage(content=prompt)]
+        response = await llm.ainvoke(messages)
+        text = response.content
+        return {"text": text, "model": model_name, "raw": {"provider": "openai", "content": text}}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"OpenAI error: {str(e)}") from e
 
 
 async def generate_anthropic(prompt: str, model: Optional[str], max_tokens: int, temperature: float, extra: Optional[dict]):
+    """LangChain-based Anthropic implementation"""
     key = os.getenv("ANTHROPIC_API_KEY")
     if not key:
         raise HTTPException(status_code=400, detail="ANTHROPIC_API_KEY not set")
 
-    model = model or "claude-2.1"
-    url = "https://api.anthropic.com/v1/complete"
-    headers = {"x-api-key": key, "Content-Type": "application/json"}
-    # Anthropic expects a prompt including human/assistant tokens; keep it simple:
-    anthropic_prompt = f"\n\nHuman: {prompt}\n\nAssistant:"
-    payload = {
-        "model": model,
-        "prompt": anthropic_prompt,
-        "max_tokens_to_sample": max_tokens,
-        "temperature": temperature,
-    }
-    if extra:
-        payload.update(extra)
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(url, json=payload, headers=headers)
-        try:
-            r.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            raise HTTPException(status_code=502, detail=f"Anthropic error: {r.text}") from e
-        data = r.json()
-        text = data.get("completion", "")
-        return {"text": text, "model": model, "raw": data}
+    model_name = model or "claude-3-sonnet-20240229"
+    
+    try:
+        llm = ChatAnthropic(
+            model=model_name,
+            anthropic_api_key=key,
+            temperature=temperature,
+            max_tokens=max_tokens
+        )
+        messages = [HumanMessage(content=prompt)]
+        response = await llm.ainvoke(messages)
+        text = response.content
+        return {"text": text, "model": model_name, "raw": {"provider": "anthropic", "content": text}}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Anthropic error: {str(e)}") from e
 
 
 async def generate_gemini(prompt: str, model: Optional[str], max_tokens: int, temperature: float, extra: Optional[dict]):
     """
-    Optional helper using google generative python package. If that package isn't installed,
-    explain how to enable it or use the custom provider.
+    LangChain-based Gemini implementation with fallback to Ollama llama3.2
+    Gemini is the default provider. If it fails, automatically routes to Ollama.
     """
-    try:
-        import google.generativeai as genai  # type: ignore
-    except Exception as e:
-        raise HTTPException(
-            status_code=400,
-            detail="google.generativeai not installed or not configured. "
-                   "Install google-generativeai and set GOOGLE_API_KEY, or use provider='custom'."
-        ) from e
-
     key = os.getenv("GOOGLE_API_KEY")
-    if not key:
-        raise HTTPException(status_code=400, detail="GOOGLE_API_KEY not set for Gemini")
-
-    genai.configure(api_key=key)
-    model = model or "models/text-bison-001"
-    # The package may accept different parameters; this is a simple call that works with typical installs.
-    resp = genai.generate_text(model=model, prompt=prompt, temperature=temperature, max_output_tokens=max_tokens)
-    # resp may have .text or .candidates
-    text = getattr(resp, "text", None) or (resp.candidates[0].output if getattr(resp, "candidates", None) else str(resp))
-    return {"text": text, "model": model, "raw": resp}
+    model_name = model or "gemini-1.5-flash"
+    
+    # Try Gemini first (commercial provider)
+    if key:
+        try:
+            llm = ChatGoogleGenerativeAI(
+                model=model_name,
+                google_api_key=key,
+                temperature=temperature,
+                max_output_tokens=max_tokens
+            )
+            messages = [HumanMessage(content=prompt)]
+            response = await llm.ainvoke(messages)
+            text = response.content
+            return {"text": text, "model": model_name, "raw": {"provider": "gemini", "content": text}}
+        except Exception as gemini_error:
+            # Log the error and fallback to Ollama
+            print(f"Gemini failed with error: {gemini_error}. Falling back to Ollama llama3.2...")
+    
+    # Fallback to Ollama llama3.2 (local/free provider)
+    try:
+        ollama_model = "llama3.2"
+        ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        
+        llm = ChatOllama(
+            model=ollama_model,
+            base_url=ollama_base_url,
+            temperature=temperature,
+        )
+        messages = [HumanMessage(content=prompt)]
+        response = await llm.ainvoke(messages)
+        text = response.content
+        return {"text": text, "model": ollama_model, "raw": {"provider": "ollama", "fallback": True, "content": text}}
+    except Exception as ollama_error:
+        # Both providers failed
+        raise HTTPException(
+            status_code=502,
+            detail=f"Both Gemini and Ollama failed. Gemini: {key is None and 'No API key' or 'API error'}. Ollama: {str(ollama_error)}"
+        )
 
 
 async def generate_grok(prompt: str, model: Optional[str], max_tokens: int, temperature: float, extra: Optional[dict]):
@@ -214,7 +218,13 @@ async def generate(req: GenerateRequest):
 # Health
 @app.get("/health")
 def health():
-    return {"status": "ok", "providers": ["openai", "anthropic", "gemini (optional)", "grok (requires GROK_API_URL/GROK_API_KEY)", "custom"]}
+    return {
+        "status": "ok", 
+        "providers": ["openai", "anthropic", "gemini (default, with Ollama llama3.2 fallback)", "grok (requires GROK_API_URL/GROK_API_KEY)", "custom"],
+        "langchain_enabled": True,
+        "default_provider": "gemini",
+        "fallback_provider": "ollama llama3.2"
+    }
 
 
 # Run with: python main.py
